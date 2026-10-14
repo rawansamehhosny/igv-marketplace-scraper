@@ -1,0 +1,26 @@
+{
+  "tenantId": "3332001",
+  "isTenantOnSale": true,
+  "pageIndex": 1,
+  "pageSize": 16,
+  "brandIds": [
+    "2728"
+  ],
+  "isShowAttrTag": false,
+  "isShowAttr": true,
+  "isShowGuarantee": true,
+  "productCategoryAttrs": [],
+  "keywords": "",
+  "tenantCategoryId3": "76498313579",
+  "automationKeywords": "",
+  "sorts": [
+    {
+      "field": "bestMatchScore",
+      "isAsc": false
+    }
+  ],
+  "isShowSellerInfo": true,
+  "isShowSellerStar": true,
+  "siteId": "1628721356376162310",
+  "toCurrencyId": "1598942409803481063"
+}

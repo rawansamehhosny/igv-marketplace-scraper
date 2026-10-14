@@ -1,0 +1,45 @@
+# Environments and Virtual Environments
+venv/
+env/
+.env
+.venv/
+ENV/
+
+# Python Bytecode and Caches
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+
+# Scraped Data, Output Reports, and Checkpoints
+*.xlsx
+*.xls
+*.csv
+*_checkpoint.csv
+qa_test_checkpoint.csv
+qa_category_mapping_report.xlsx
+qa_sample_scraped_offers.xlsx
+igv_*.xlsx
+multi_game_*.xlsx
+fortnite_*.xlsx
+game_batches/
+
+# Temporary and Lock Files
+~$*
+*.tmp
+
+# Debug Dumps and Raw HTML Caches
+*debug*.json
+debug_*.json
+*.html
+categories_accounts_raw.html
+productSpuImages
+powershell.bat
+
+# OS and Editor Artifacts
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/
+*.log
