@@ -204,29 +204,48 @@ def fetch_seller_profile(session: requests.Session, seller_id: str) -> tuple[dic
     return {}, False
 
 
-def fetch_offer_description(session: requests.Session, offer_id: str, game_url: str) -> tuple[str, str]:
+def fetch_offer_description(session: requests.Session, offer_id: str, game_url: str) -> tuple[str, str, list[str]]:
+    """Fetches offer description text and any embedded image URLs.
+    Returns: (cleaned_text, status, image_urls_list)
+    """
     if not offer_id or str(offer_id).strip() in ("", "None", "N/A"):
-        return "N/A", "empty"
+        return "N/A", "empty", []
     polite_sleep(ITEM_REQUEST_DELAY)
     url = f"{PRODUCT_DETAIL_ENDPOINT}{str(offer_id).strip()}"
     headers = dict(COMMON_HEADERS)
     headers["referer"] = f"{game_url.rstrip('/')}/{offer_id}"
     payload = {"siteId": SITE_ID, "tenantId": TENANT_ID}
-    
+
     resp = safe_request(session, "POST", url, json_data=payload, headers=headers)
     if resp is None or resp.status_code != 200:
-        return "N/A", "failed"
+        return "N/A", "failed", []
     try:
         data = resp.json()
         if str(data.get("code")) in ("0000", "0", "200"):
             raw_desc = (data.get("data") or {}).get("noResp", {}).get("description")
             if raw_desc and str(raw_desc).strip():
-                cleaned = clean_html_text(str(raw_desc))
-                return (cleaned, "ok") if cleaned != "N/A" else ("N/A", "empty")
-            return "N/A", "empty"
+                soup_desc = BeautifulSoup(str(raw_desc), "html.parser")
+                # Extract all embedded image URLs from description HTML
+                desc_img_urls = [
+                    str(img.get("src") or img.get("data-src") or "").strip()
+                    for img in soup_desc.find_all("img")
+                    if img.get("src") or img.get("data-src")
+                ]
+                desc_img_urls = [u for u in desc_img_urls if u and u.startswith("http")]
+                # Remove img tags before extracting clean text
+                for img in soup_desc.find_all("img"):
+                    img.decompose()
+                cleaned = clean_html_text(soup_desc.get_text(separator="\n"))
+                return (cleaned, "ok", desc_img_urls) if cleaned != "N/A" else ("N/A", "empty", desc_img_urls)
+            return "N/A", "empty", []
     except Exception:
         pass
-    return "N/A", "failed"
+    return "N/A", "failed", []
+
+
+def _is_numeric_id(val: str) -> bool:
+    """Returns True if val looks like a raw numeric platform ID (long integer string)."""
+    return val.isdigit() and len(val) >= 10
 
 
 def extract_tags(item: dict[str, Any]) -> list[str]:
@@ -236,9 +255,12 @@ def extract_tags(item: dict[str, Any]) -> list[str]:
         if isinstance(attr, dict):
             name = str(attr.get("categoryAttrName") or "").strip()
             val = str(attr.get("categoryAttrValueName") or "").strip()
-            if name and val:
+            # Skip empty values or raw numeric IDs (platform internal IDs, not human-readable text)
+            if not val or val in ("None", "null") or _is_numeric_id(val):
+                continue
+            if name and not (name in ("None", "null") or _is_numeric_id(name)):
                 grouped_tags.setdefault(name, []).append(val)
-            elif val and not name:
+            elif not name or name in ("None", "null"):
                 grouped_tags.setdefault("Other", []).append(val)
     tags: list[str] = []
     for name, vals in grouped_tags.items():
@@ -272,11 +294,25 @@ def parse_offer(
     item_index: int,
     seller_info: dict[str, Any],
     description: str,
+    desc_images: list[str] | None = None,
 ) -> dict[str, Any]:
     offer_id = str(item.get("id") or item.get("productSpuId") or "")
-    detail_url = urljoin(SITE_BASE_URL, f"product/{offer_id}") if offer_id else game_url
+    # Fix #4: Items use a different URL pattern than Accounts
+    is_items_cat = category_name.lower() not in ("accounts", "account")
+    if offer_id:
+        if is_items_cat:
+            detail_url = urljoin(SITE_BASE_URL, f"items/{offer_id}")
+        else:
+            detail_url = urljoin(SITE_BASE_URL, f"product/{offer_id}")
+    else:
+        detail_url = game_url
     tags = extract_tags(item)
     img_list = extract_images(item)
+    # Fix #3: Merge description images into the main Images column
+    if desc_images:
+        for di in desc_images:
+            if di and di not in img_list:
+                img_list.append(di)
 
     # Offer Type
     raw_type = str(item.get("productType") or item.get("type") or "").strip()
@@ -453,11 +489,13 @@ def scrape_game(
         })
 
     offers_collected: list[dict[str, Any]] = []
+    # Fix #5: Dynamic pagination — discover actual page count from first API response
+    actual_max_pages = max_pages  # will be updated after first page
 
-    for page_idx in range(1, max_pages + 1):
+    for page_idx in range(1, actual_max_pages + 1):
         payload["pageIndex"] = page_idx
-        print(f"  📄 Fetching Page {page_idx}/{max_pages}...")
-        
+        print(f"  📄 Fetching Page {page_idx}/{actual_max_pages}...")
+
         resp = safe_request(session, "POST", current_endpoint, json_data=payload, headers=headers)
         if resp is None or resp.status_code != 200:
             print(f"    ❌ Failed to load page {page_idx}.")
@@ -469,16 +507,23 @@ def scrape_game(
             break
 
         data_obj = data.get("data") or {}
-        
+
         # بنسحب الداتا من المكان الصح حسب نوع الـ API
         if is_standard_api:
             mix_resp = data_obj.get("mixPageResp") or {}
             items = mix_resp.get("list") or []
-            total_items = mix_resp.get("totalCount") or 0
+            total_items = int(mix_resp.get("totalCount") or 0)
+            api_page_count = int(mix_resp.get("pageCount") or 1)
         else:
             items = data_obj.get("list") or []
-            total_items = data_obj.get("totalCount") or 0
-        
+            total_items = int(data_obj.get("totalCount") or 0)
+            api_page_count = int(data_obj.get("pageCount") or 1)
+
+        # Update actual pages on first response (respects max_pages cap)
+        if page_idx == 1:
+            actual_max_pages = min(api_page_count, max_pages)
+            print(f"    ℹ️ API reports totalCount={total_items:,}, pageCount={api_page_count:,}. Will fetch {actual_max_pages} page(s).")
+
         if not items:
             print(f"    ℹ️ Page {page_idx} returned 0 offers. End of results.")
             break
@@ -494,7 +539,10 @@ def scrape_game(
 
             offer_id = str(item.get("id") or item.get("productSpuId") or "")
             target_desc_id = str(item.get("standardId") or offer_id or "")
-            desc, _ = fetch_offer_description(session, target_desc_id, game_url) if target_desc_id else ("N/A", "empty")
+            if target_desc_id:
+                desc, _, desc_imgs = fetch_offer_description(session, target_desc_id, game_url)
+            else:
+                desc, desc_imgs = "N/A", []
 
             parsed = parse_offer(
                 item=item,
@@ -505,6 +553,7 @@ def scrape_game(
                 item_index=item_idx,
                 seller_info=seller_info,
                 description=desc,
+                desc_images=desc_imgs,
             )
             offers_collected.append(parsed)
 
