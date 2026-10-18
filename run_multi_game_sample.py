@@ -204,12 +204,12 @@ def fetch_seller_profile(session: requests.Session, seller_id: str) -> tuple[dic
     return {}, False
 
 
-def fetch_offer_description(session: requests.Session, offer_id: str, game_url: str) -> tuple[str, str, list[str]]:
-    """Fetches offer description text and any embedded image URLs.
-    Returns: (cleaned_text, status, image_urls_list)
-    """
+def fetch_offer_description(session: requests.Session, offer_id: str, game_url: str) -> tuple[str, str, list[str], dict[str, Any]]:
+    """Fetches offer description, images, and hidden extra details (warranty/delivery/seller/publish_date for items)."""
+    extra_details = {"warranty": None, "delivery": None, "seller_id": None, "seller_store_name": None, "publish_date": None}
     if not offer_id or str(offer_id).strip() in ("", "None", "N/A"):
-        return "N/A", "empty", []
+        return "N/A", "empty", [], extra_details
+
     polite_sleep(ITEM_REQUEST_DELAY)
     url = f"{PRODUCT_DETAIL_ENDPOINT}{str(offer_id).strip()}"
     headers = dict(COMMON_HEADERS)
@@ -218,11 +218,44 @@ def fetch_offer_description(session: requests.Session, offer_id: str, game_url: 
 
     resp = safe_request(session, "POST", url, json_data=payload, headers=headers)
     if resp is None or resp.status_code != 200:
-        return "N/A", "failed", []
+        return "N/A", "failed", [], extra_details
+
     try:
         data = resp.json()
         if str(data.get("code")) in ("0000", "0", "200"):
-            raw_desc = (data.get("data") or {}).get("noResp", {}).get("description")
+            no_resp = (data.get("data") or {}).get("noResp") or {}
+
+            # --- استخراج بيانات البائع والضمان والتوصيل وتاريخ النشر المخفية للآيتمز ---
+            # 1. بيانات البائع المخفية
+            if no_resp.get("sellerId"):
+                extra_details["seller_id"] = str(no_resp.get("sellerId"))
+            if no_resp.get("sellerStoreName"):
+                extra_details["seller_store_name"] = str(no_resp.get("sellerStoreName"))
+
+            # 2. الضمان
+            g_days = no_resp.get("categoryGuaranteeDays")
+            g_hours = no_resp.get("categoryGuaranteeHours")
+            if g_days and str(g_days).strip() not in ("0", "None"):
+                extra_details["warranty"] = f"{g_days}d Warranty"
+            elif g_hours and str(g_hours).strip() not in ("0", "None"):
+                extra_details["warranty"] = f"{g_hours}h Warranty"
+
+            # 3. التوصيل (من الـ Skus)
+            skus = no_resp.get("productSkus") or []
+            if skus and isinstance(skus, list):
+                d_time = skus[0].get("deliveryTime")
+                d_unit = skus[0].get("deliveryTimeUnit")  # 3 = Min, 2 = Hours, 1 = Days
+                if d_time and str(d_time).strip() not in ("None", "", "0"):
+                    unit_str = "Min" if d_unit == 3 else ("Hours" if d_unit == 2 else "Days")
+                    extra_details["delivery"] = f"within {d_time} {unit_str}"
+
+            # 4. تاريخ النشر المخفي
+            pub_date = no_resp.get("publishDate") or no_resp.get("updateTime")
+            if pub_date and str(pub_date).strip() not in ("None", "", "0"):
+                extra_details["publish_date"] = str(pub_date).strip()
+
+            # --- استخراج الوصف والصور ---
+            raw_desc = no_resp.get("description")
             if raw_desc and str(raw_desc).strip():
                 soup_desc = BeautifulSoup(str(raw_desc), "html.parser")
                 # Extract all embedded image URLs from description HTML
@@ -236,11 +269,11 @@ def fetch_offer_description(session: requests.Session, offer_id: str, game_url: 
                 for img in soup_desc.find_all("img"):
                     img.decompose()
                 cleaned = clean_html_text(soup_desc.get_text(separator="\n"))
-                return (cleaned, "ok", desc_img_urls) if cleaned != "N/A" else ("N/A", "empty", desc_img_urls)
-            return "N/A", "empty", []
+                return (cleaned, "ok", desc_img_urls, extra_details) if cleaned != "N/A" else ("N/A", "empty", desc_img_urls, extra_details)
+            return "N/A", "empty", [], extra_details
     except Exception:
         pass
-    return "N/A", "failed", []
+    return "N/A", "failed", [], extra_details
 
 
 def _is_numeric_id(val: str) -> bool:
@@ -297,13 +330,9 @@ def parse_offer(
     desc_images: list[str] | None = None,
 ) -> dict[str, Any]:
     offer_id = str(item.get("id") or item.get("productSpuId") or "")
-    # Fix #4: Items use a different URL pattern than Accounts
-    is_items_cat = category_name.lower() not in ("accounts", "account")
+    # IGV uses /items/{offer_id} for all offer details across all categories
     if offer_id:
-        if is_items_cat:
-            detail_url = urljoin(SITE_BASE_URL, f"items/{offer_id}")
-        else:
-            detail_url = urljoin(SITE_BASE_URL, f"product/{offer_id}")
+        detail_url = urljoin(SITE_BASE_URL, f"items/{offer_id}")
     else:
         detail_url = game_url
     tags = extract_tags(item)
@@ -324,27 +353,35 @@ def parse_offer(
         offer_type = "Sale"
 
     # Delivery speed
-    delivery_code = str(item.get("deliveryType") or "").strip()
-    if delivery_code == "1":
-        delivery_speed = "Instant"
-    elif delivery_code == "2":
-        delivery_speed = "10 Min"
-    elif delivery_code == "3":
-        delivery_speed = "Manual / Specified"
+    hidden_delivery = item.get("_hidden_delivery")
+    if hidden_delivery:
+        delivery_speed = hidden_delivery
     else:
-        delivery_speed = delivery_code if delivery_code not in ("None", "") else "N/A"
+        delivery_code = str(item.get("deliveryType") or "").strip()
+        if delivery_code == "1":
+            delivery_speed = "Instant"
+        elif delivery_code == "2":
+            delivery_speed = "10 Min"
+        elif delivery_code == "3":
+            delivery_speed = "Manual / Specified"
+        else:
+            delivery_speed = delivery_code if delivery_code not in ("None", "") else "N/A"
 
     # Warranty / Guarantee
-    hours = item.get("afterSalesHours") or item.get("categoryGuaranteeHours")
-    days = item.get("categoryGuaranteeDays")
-    if hours and str(hours).strip() not in ("None", "0"):
-        warranty = f"{hours}h Warranty"
-    elif days and str(days).strip() not in ("None", "0"):
-        warranty = f"{days}d Warranty"
-    elif item.get("isGuaranteedCompensation") is True:
-        warranty = "Guaranteed"
+    hidden_warranty = item.get("_hidden_warranty")
+    if hidden_warranty:
+        warranty = hidden_warranty
     else:
-        warranty = "N/A"
+        hours = item.get("afterSalesHours") or item.get("categoryGuaranteeHours")
+        days = item.get("categoryGuaranteeDays")
+        if hours and str(hours).strip() not in ("None", "0"):
+            warranty = f"{hours}h Warranty"
+        elif days and str(days).strip() not in ("None", "0"):
+            warranty = f"{days}d Warranty"
+        elif item.get("isGuaranteedCompensation") is True:
+            warranty = "Guaranteed"
+        else:
+            warranty = "N/A"
 
     # Seller Name: prefer storeName from store profile
     seller_name = seller_info.get("storeName") or seller_info.get("sellerName") or item.get("sellerStoreName") or item.get("sellerName") or "N/A"
@@ -414,7 +451,7 @@ def parse_offer(
         "Seller Sales Volume": str(sales_vol),
         "Seller Verified (KYC)": str(verified_str),
         "Seller Delivery Speed": str(delivery_score),
-        "Publish Date": str(item.get("publishDate") or item.get("createTime") or "N/A"),
+        "Publish Date": str(item.get("_hidden_publish_date") or item.get("publishDate") or item.get("createTime") or "N/A"),
         "Description": str(description if description and description != "N/A" else "N/A"),
         "Offer ID": str(offer_id or "N/A"),
         "Offer URL": str(detail_url),
@@ -534,15 +571,34 @@ def scrape_game(
         print(f"    📦 Page {page_idx} contains {len(items)} offers (Game total available: {total_items:,}). Enriching...")
         
         for item_idx, item in enumerate(items, 1):
-            seller_id = str(item.get("sellerId") or "")
-            seller_info, _ = fetch_seller_profile(session, seller_id) if seller_id else ({}, True)
-
             offer_id = str(item.get("id") or item.get("productSpuId") or "")
             target_desc_id = str(item.get("standardId") or offer_id or "")
+
+            # 1. جلب الوصف والتفاصيل المخفية أولاً (للتقاط بيانات البائع والضمان والتوصيل)
             if target_desc_id:
-                desc, _, desc_imgs = fetch_offer_description(session, target_desc_id, game_url)
+                desc, _, desc_imgs, extra_details = fetch_offer_description(session, target_desc_id, game_url)
             else:
-                desc, desc_imgs = "N/A", []
+                desc, desc_imgs, extra_details = "N/A", [], {}
+
+            # 2. تحديد Seller ID (من اللستة برة، ولو غير موجود نسحبه من تفاصيل العرض المخفية)
+            seller_id = str(item.get("sellerId") or extra_details.get("seller_id") or "")
+
+            # 3. جلب بروفايل البائع
+            seller_info, _ = fetch_seller_profile(session, seller_id) if seller_id else ({}, True)
+
+            # استخدام اسم المتجر من تفاصيل العرض إن لم يكن موجوداً بالبروفايل
+            if not seller_info.get("storeName") and extra_details.get("seller_store_name"):
+                seller_info["storeName"] = extra_details["seller_store_name"]
+
+            # ربط الحقول المخفية داخل الـ item لتقرأها parse_offer
+            if extra_details.get("warranty"):
+                item["_hidden_warranty"] = extra_details["warranty"]
+            if extra_details.get("delivery"):
+                item["_hidden_delivery"] = extra_details["delivery"]
+            if extra_details.get("publish_date"):
+                item["_hidden_publish_date"] = extra_details["publish_date"]
+            if not item.get("sellerId") and seller_id:
+                item["sellerId"] = seller_id
 
             parsed = parse_offer(
                 item=item,

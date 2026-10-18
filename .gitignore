@@ -43,3 +43,14 @@ desktop.ini
 .vscode/
 .idea/
 *.log
+
+# Diagnostic, Probe, and Scratch Scripts
+probe_*.py
+test_large_*.py
+verify_*.py
+inspect_*.py
+scratch_*.py
+
+# One-off test runners for individual games
+scrape_*_items.py
+scrape_*_accounts.py
