@@ -8,6 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 import json
 import random
+import re
 import sys
 import time
 from pathlib import Path
@@ -313,37 +314,94 @@ def fetch_offer_description(session: requests.Session, offer_id: str) -> tuple[s
     return "N/A", "failed"
 
 
+def _is_id_value(val: str) -> bool:
+    """Returns True if val looks like an internal database or platform ID rather than human-readable text."""
+    if not val or not isinstance(val, str):
+        return True
+    v = val.strip()
+    if not v or v.lower() in ("none", "null", "undefined", "n/a", "na", ""):
+        return True
+    # 1. MongoDB ObjectId: 24 hex characters
+    if len(v) == 24 and re.fullmatch(r"[0-9a-fA-F]{24}", v):
+        return True
+    # 2. UUID or 32-char hex hash
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", v):
+        return True
+    if len(v) == 32 and re.fullmatch(r"[0-9a-fA-F]{32}", v):
+        return True
+    # 3. Raw long numeric platform ID (>= 8 digits)
+    if v.isdigit() and len(v) >= 8:
+        return True
+    return False
+
+
+def normalize_delivery_to_minutes(d_val: Any, d_unit: Any = None) -> str:
+    """
+    Normalizes delivery time to pure integer minutes without any words or letters.
+    """
+    if d_val is None:
+        return "N/A"
+    if d_unit is not None:
+        try:
+            val_num = int(float(str(d_val).strip()))
+            unit_code = int(str(d_unit).strip())
+            if unit_code == 3:  # Minutes
+                return str(val_num)
+            elif unit_code == 2:  # Hours
+                return str(val_num * 60)
+            elif unit_code == 1:  # Days
+                return str(val_num * 1440)
+        except (ValueError, TypeError):
+            pass
+
+    s = str(d_val).strip()
+    if not s or s.lower() in ("none", "null", "n/a", "", "manual / specified", "manual", "unknown"):
+        return "N/A"
+    if s.lower() in ("instant", "0", "0 min", "0m"):
+        return "0"
+
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m)?', s, re.IGNORECASE)
+    if m:
+        num_str, unit = m.group(1), m.group(2)
+        try:
+            num = float(num_str)
+            if not unit:
+                return str(int(num))
+            u = unit.lower()
+            if u.startswith("d"):
+                return str(int(num * 1440))
+            elif u.startswith("h"):
+                return str(int(num * 60))
+            elif u.startswith("m"):
+                return str(int(num))
+        except (ValueError, TypeError):
+            pass
+    return "N/A"
+
+
 def extract_tags(item: dict[str, Any]) -> list[str]:
     attrs = item.get("productSpuCategoryAttrs") or []
-    grouped_tags = {}
-    
-    # تجميع الـ Values اللي ليهم نفس الـ Key
+    grouped_tags: dict[str, list[str]] = {}
     for attr in attrs:
         if isinstance(attr, dict):
             name = str(attr.get("categoryAttrName") or "").strip()
             val = str(attr.get("categoryAttrValueName") or "").strip()
-            if name and val:
-                if name in grouped_tags:
-                    grouped_tags[name].append(val)
-                else:
-                    grouped_tags[name] = [val]
-            elif val and not name:
-                if "Other" in grouped_tags:
-                    grouped_tags["Other"].append(val)
-                else:
-                    grouped_tags["Other"] = [val]
-
-    # دمجهم بالشكل المطلوب: Name//Val1--Val2
-    tags = []
+            # Skip empty values or raw internal IDs
+            if not val or _is_id_value(val):
+                continue
+            if name and _is_id_value(name):
+                continue
+            if name:
+                grouped_tags.setdefault(name, []).append(val)
+            else:
+                grouped_tags.setdefault("Other", []).append(val)
+    tags: list[str] = []
     for name, vals in grouped_tags.items():
+        unique_vals = list(dict.fromkeys(vals))
         if name == "Other":
-            for v in vals:
-                tags.append(v)
+            tags.extend(unique_vals)
         else:
-            # دمج القيم بـ --
-            merged_values = "--".join(vals)
-            tags.append(f"{name}//{merged_values}")
-            
+            tags.append(f"{name}//{'--'.join(unique_vals)}")
     return tags
 
 
@@ -376,6 +434,22 @@ def parse_offer(
 
     tags = extract_tags(item)
 
+    # Helper to extract all matching tag values (case‑insensitive)
+    def _extract_all_matching(prefix: str) -> list[str]:
+        """Return a list of values for tags whose name starts with *prefix*.
+        If a tag contains multiple values separated by '--', they are split.
+        Returns empty list if none found."""
+        values = []
+        for tag in tags:
+            if tag.lower().startswith(prefix.lower() + "//"):
+                # tag format: Name//val1--val2
+                vals_part = tag.split("//", 1)[1]
+                for v in vals_part.split("--"):
+                    v_clean = v.strip()
+                    if v_clean:
+                        values.append(v_clean)
+        return values
+
     # 1. تحديد نوع الأوفر
     tx_type = item.get("transactionType")
     offer_type = "Sale" if tx_type == 1 else ("Rent" if tx_type == 2 else "N/A")
@@ -385,16 +459,14 @@ def parse_offer(
     guarantee_days = item.get("categoryGuaranteeDays")
     warranty = f"{guarantee_days} Days" if guarantee_days else "No Warranty"
 
-    # التوصيل: الموقع بيستخدم أكواد. غالباً 1 = Instant, 2 = Short time (10min), 3 = Manual
+    # التوصيل: تحويل التوصيل إلى دقائق فقط بدون حروف
     delivery_code = item.get("deliveryType")
-    if delivery_code == 1:
-        delivery_speed = "Instant"
-    elif delivery_code == 2:
-        delivery_speed = "10 Min"
-    elif delivery_code == 3:
-        delivery_speed = "Manual / Specified"
+    if str(delivery_code).strip() == "1":
+        delivery_time_min = "0"
+    elif str(delivery_code).strip() == "2":
+        delivery_time_min = "10"
     else:
-        delivery_speed = str(delivery_code) if delivery_code else "N/A"
+        delivery_time_min = normalize_delivery_to_minutes(delivery_code)
 
     # 3. الصور والرابط
     img_list = extract_images(item)
@@ -449,7 +521,7 @@ def parse_offer(
         "Title": item.get("title") or item.get("productSpuName") or "N/A",
         "Price": price,
         "Currency": "USD",
-        "Delivery Speed": delivery_speed,    # <--- العمود الجديد
+        "Delivery Time (Min)": str(delivery_time_min),
         "Warranty": warranty,                # <--- العمود الجديد
         "Seller ID": item.get("sellerId") or "N/A",
         "Seller Name": seller_name,

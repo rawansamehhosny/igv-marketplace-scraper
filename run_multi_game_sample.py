@@ -245,9 +245,8 @@ def fetch_offer_description(session: requests.Session, offer_id: str, game_url: 
             if skus and isinstance(skus, list):
                 d_time = skus[0].get("deliveryTime")
                 d_unit = skus[0].get("deliveryTimeUnit")  # 3 = Min, 2 = Hours, 1 = Days
-                if d_time and str(d_time).strip() not in ("None", "", "0"):
-                    unit_str = "Min" if d_unit == 3 else ("Hours" if d_unit == 2 else "Days")
-                    extra_details["delivery"] = f"within {d_time} {unit_str}"
+                if d_time is not None and str(d_time).strip() not in ("None", ""):
+                    extra_details["delivery"] = normalize_delivery_to_minutes(d_time, d_unit)
 
             # 4. تاريخ النشر المخفي
             pub_date = no_resp.get("publishDate") or no_resp.get("updateTime")
@@ -276,9 +275,76 @@ def fetch_offer_description(session: requests.Session, offer_id: str, game_url: 
     return "N/A", "failed", [], extra_details
 
 
-def _is_numeric_id(val: str) -> bool:
-    """Returns True if val looks like a raw numeric platform ID (long integer string)."""
-    return val.isdigit() and len(val) >= 10
+def _is_id_value(val: str) -> bool:
+    """Returns True if val looks like an internal database or platform ID rather than human-readable text."""
+    if not val or not isinstance(val, str):
+        return True
+    v = val.strip()
+    if not v or v.lower() in ("none", "null", "undefined", "n/a", "na", ""):
+        return True
+    # 1. MongoDB ObjectId: 24 hex characters (e.g. 67a916d2e24d797c1dab9df2)
+    if len(v) == 24 and re.fullmatch(r"[0-9a-fA-F]{24}", v):
+        return True
+    # 2. UUID or 32-char hex hash
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", v):
+        return True
+    if len(v) == 32 and re.fullmatch(r"[0-9a-fA-F]{32}", v):
+        return True
+    # 3. Raw long numeric platform ID (>= 8 digits)
+    if v.isdigit() and len(v) >= 8:
+        return True
+    return False
+
+
+def normalize_delivery_to_minutes(d_val: Any, d_unit: Any = None) -> str:
+    """
+    Normalizes delivery time to pure integer minutes without any words or letters.
+    Examples:
+      - 5 Min -> "5"
+      - 1 Hours -> "60"
+      - 2 Hours -> "120"
+      - 1 Days -> "1440"
+      - "Instant" -> "0"
+      - Unknown / None -> "N/A"
+    """
+    if d_val is None:
+        return "N/A"
+    if d_unit is not None:
+        try:
+            val_num = int(float(str(d_val).strip()))
+            unit_code = int(str(d_unit).strip())
+            if unit_code == 3:  # Minutes
+                return str(val_num)
+            elif unit_code == 2:  # Hours
+                return str(val_num * 60)
+            elif unit_code == 1:  # Days
+                return str(val_num * 1440)
+        except (ValueError, TypeError):
+            pass
+
+    s = str(d_val).strip()
+    if not s or s.lower() in ("none", "null", "n/a", "", "manual / specified", "manual", "unknown"):
+        return "N/A"
+    if s.lower() in ("instant", "0", "0 min", "0m"):
+        return "0"
+
+    m = re.search(r'(\d+(?:\.\d+)?)\s*(days?|d|hours?|hrs?|h|minutes?|mins?|m)?', s, re.IGNORECASE)
+    if m:
+        num_str, unit = m.group(1), m.group(2)
+        try:
+            num = float(num_str)
+            if not unit:
+                return str(int(num))
+            u = unit.lower()
+            if u.startswith("d"):
+                return str(int(num * 1440))
+            elif u.startswith("h"):
+                return str(int(num * 60))
+            elif u.startswith("m"):
+                return str(int(num))
+        except (ValueError, TypeError):
+            pass
+    return "N/A"
 
 
 def extract_tags(item: dict[str, Any]) -> list[str]:
@@ -288,19 +354,22 @@ def extract_tags(item: dict[str, Any]) -> list[str]:
         if isinstance(attr, dict):
             name = str(attr.get("categoryAttrName") or "").strip()
             val = str(attr.get("categoryAttrValueName") or "").strip()
-            # Skip empty values or raw numeric IDs (platform internal IDs, not human-readable text)
-            if not val or val in ("None", "null") or _is_numeric_id(val):
+            # Skip empty values or raw internal IDs (platform internal IDs or hex ObjectIds)
+            if not val or _is_id_value(val):
                 continue
-            if name and not (name in ("None", "null") or _is_numeric_id(name)):
+            if name and _is_id_value(name):
+                continue
+            if name:
                 grouped_tags.setdefault(name, []).append(val)
-            elif not name or name in ("None", "null"):
+            else:
                 grouped_tags.setdefault("Other", []).append(val)
     tags: list[str] = []
     for name, vals in grouped_tags.items():
+        unique_vals = list(dict.fromkeys(vals))
         if name == "Other":
-            tags.extend(vals)
+            tags.extend(unique_vals)
         else:
-            tags.append(f"{name}//{'--'.join(vals)}")
+            tags.append(f"{name}//{'--'.join(unique_vals)}")
     return tags
 
 
@@ -316,7 +385,6 @@ def extract_images(item: dict[str, Any]) -> list[str]:
     if not img_list and item.get("imageUrl"):
         img_list.append(str(item["imageUrl"]).strip())
     return img_list
-
 
 def parse_offer(
     item: dict[str, Any],
@@ -352,20 +420,18 @@ def parse_offer(
     else:
         offer_type = "Sale"
 
-    # Delivery speed
+    # Delivery time in minutes (pure integer minutes, numbers only)
     hidden_delivery = item.get("_hidden_delivery")
-    if hidden_delivery:
-        delivery_speed = hidden_delivery
+    if hidden_delivery is not None and str(hidden_delivery).strip() not in ("None", "", "N/A"):
+        delivery_time_min = normalize_delivery_to_minutes(hidden_delivery)
     else:
         delivery_code = str(item.get("deliveryType") or "").strip()
         if delivery_code == "1":
-            delivery_speed = "Instant"
+            delivery_time_min = "0"  # Instant delivery = 0 minutes
         elif delivery_code == "2":
-            delivery_speed = "10 Min"
-        elif delivery_code == "3":
-            delivery_speed = "Manual / Specified"
+            delivery_time_min = "10"  # 10 Min
         else:
-            delivery_speed = delivery_code if delivery_code not in ("None", "") else "N/A"
+            delivery_time_min = normalize_delivery_to_minutes(delivery_code)
 
     # Warranty / Guarantee
     hidden_warranty = item.get("_hidden_warranty")
@@ -435,7 +501,7 @@ def parse_offer(
         "Title": str(item.get("title") or item.get("productSpuName") or "N/A"),
         "Price": str(price),
         "Currency": "USD",
-        "Delivery Speed": str(delivery_speed),
+        "Delivery Time (Min)": str(delivery_time_min),
         "Warranty": str(warranty),
         "Seller ID": str(item.get("sellerId") or "N/A"),
         "Seller Name": str(seller_name),
@@ -627,7 +693,7 @@ def main() -> None:
     session = requests.Session()
     all_results: list[dict[str, Any]] = []
 
-    # Selected multi-game sample: Fortnite, Clash of Clan, GTA V, Genshin Impact
+    # Selected multi-game sample: Fortnite, Clash of Clans, GTA V, Genshin Impact
     test_targets = [
         {"Game": "Fortnite", "Category": "Accounts", "URL": "https://www.igv.com/fortnite/accounts"},
         {"Game": "Fortnite", "Category": "Items", "URL": "https://www.igv.com/fortnite/items"},
